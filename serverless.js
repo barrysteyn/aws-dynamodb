@@ -3,7 +3,7 @@ const AWS = require('aws-sdk')
 const { Component } = require('@serverless/core')
 const { createTable, deleteTable, describeTable, updateTable, configChanged } = require('./utils')
 
-const outputsList = ['name', 'arn', 'region']
+const outputsList = ['name', 'arn', 'region', 'stream']
 
 const defaults = {
   attributeDefinitions: [
@@ -18,26 +18,19 @@ const defaults = {
       KeyType: 'HASH'
     }
   ],
+  globalSecondaryIndexes: [],
   name: false,
-  region: 'us-east-1'
+  region: 'us-east-1',
+  stream: false
 }
 
-const setTableName = (component, inputs, config) => {
-  const generatedName = inputs.name
-    ? `${inputs.name}-${component.context.resourceId()}`
-    : component.context.resourceId()
+const setTableName = (component, inputs) => {
+  const { name, lastDeployHadNameDefined = true } = component.state
+  const generatedName = inputs.name || component.context.resourceId()
 
-  const hasDeployedBefore = 'nameInput' in component.state
-  const givenNameHasNotChanged =
-    component.state.nameInput && component.state.nameInput === inputs.name
-  const bothLastAndCurrentDeployHaveNoNameDefined = !component.state.nameInput && !inputs.name
-
-  config.name =
-    hasDeployedBefore && (givenNameHasNotChanged || bothLastAndCurrentDeployHaveNoNameDefined)
-      ? component.state.name
-      : generatedName
-
-  component.state.nameInput = inputs.name || false
+  // Name considered not changed if previous deploy did not define a name
+  // and neither did this deploy
+  return !lastDeployHadNameDefined && !inputs.name ? name : generatedName
 }
 
 class AwsDynamoDb extends Component {
@@ -58,7 +51,7 @@ class AwsDynamoDb extends Component {
       `Checking if table ${config.name} already exists in the ${config.region} region.`
     )
 
-    setTableName(this, inputs, config)
+    config.name = setTableName(this, inputs)
 
     const prevTable = await describeTable({ dynamodb, name: this.state.name })
 
@@ -66,11 +59,14 @@ class AwsDynamoDb extends Component {
       this.context.status('Creating')
       this.context.debug(`Table ${config.name} does not exist. Creating...`)
 
-      config.arn = await createTable({ dynamodb, ...config })
+      const createResponse = await createTable({ dynamodb, ...config })
+      config.arn = createResponse.tableArn
+      config.stream = createResponse.streamArn
     } else {
       this.context.debug(`Table ${config.name} already exists. Comparing config changes...`)
 
       config.arn = prevTable.arn
+      config.stream = prevTable.streamArn
 
       if (configChanged(prevTable, config)) {
         this.context.status('Updating')
@@ -79,12 +75,15 @@ class AwsDynamoDb extends Component {
         if (!equals(prevTable.name, config.name)) {
           // If "delete: false", don't delete the table
           if (config.delete === false) {
-            throw new Error(`You're attempting to change your table name from ${this.state.name} to ${config.name} which will result in you deleting your table, but you've specified the "delete" input to "false" which prevents your original table from being deleted.`)
+            throw new Error(
+              `You're attempting to change your table name from ${this.state.name} to ${config.name} which will result in you deleting your table, but you've specified the "delete" input to "false" which prevents your original table from being deleted.`
+            )
           }
           await deleteTable({ dynamodb, name: prevTable.name })
           config.arn = await createTable({ dynamodb, ...config })
         } else {
-          await updateTable({ dynamodb, ...config })
+          const prevGlobalSecondaryIndexes = prevTable.globalSecondaryIndexes || []
+          await updateTable.call(this, { dynamodb, prevGlobalSecondaryIndexes, ...config })
         }
       }
     }
@@ -95,12 +94,13 @@ class AwsDynamoDb extends Component {
 
     this.state.arn = config.arn
     this.state.name = config.name
+    this.state.stream = config.stream
     this.state.region = config.region
     this.state.delete = config.delete === false ? config.delete : true
+    this.state.lastDeployHadNameDefined = Boolean(inputs.name)
     await this.save()
 
     const outputs = pick(outputsList, config)
-
     return outputs
   }
 
